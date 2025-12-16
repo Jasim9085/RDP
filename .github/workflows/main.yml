@@ -2,11 +2,19 @@ name: RDP
 
 on:
   workflow_dispatch:
+    inputs:
+      rdp_password:
+        description: 'Optional: custom RDP password. If empty, a secure random password will be generated. For better security, set this as the repository secret RDP_PASSWORD instead.'
+        required: false
+        default: ''
 
 jobs:
   secure-rdp:
     runs-on: windows-latest
     timeout-minutes: 3600
+    # Prefer repository secret RDP_PASSWORD, otherwise fall back to workflow input
+    env:
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD || github.event.inputs.rdp_password }}
 
     steps:
       - name: Configure Core RDP Settings
@@ -32,28 +40,60 @@ jobs:
       - name: Create RDP User with Secure Password
         run: |
           Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
+
+          # If RDP_PASSWORD is provided (via secret or workflow input), use it.
+          if ($env:RDP_PASSWORD -and $env:RDP_PASSWORD -ne '') {
+              $password = $env:RDP_PASSWORD
+          } else {
+              # Generate a 16-character secure password (4 upper, 4 lower, 4 numbers, 4 special)
+              $charSet = @{
+                  Upper   = [char[]](65..90)      # A-Z
+                  Lower   = [char[]](97..122)     # a-z
+                  Number  = [char[]](48..57)      # 0-9
+                  Special = ([char[]](33..47) + [char[]](58..64) +
+                             [char[]](91..96) + [char[]](123..126)) # Special characters
+              }
+              $rawPassword = @()
+              $rawPassword += $charSet.Upper | Get-Random -Count 4
+              $rawPassword += $charSet.Lower | Get-Random -Count 4
+              $rawPassword += $charSet.Number | Get-Random -Count 4
+              $rawPassword += $charSet.Special | Get-Random -Count 4
+              $password = -join ($rawPassword | Sort-Object { Get-Random })
           }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
+
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          
+
+          # If user exists, update password; otherwise create user.
+          $existing = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          if ($existing) {
+              try {
+                  Set-LocalUser -Name "RDP" -Password $securePass
+              } catch {
+                  Write-Error "Failed to update password for existing user 'RDP': $_"
+                  exit 1
+              }
+          } else {
+              try {
+                  New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+              } catch {
+                  Write-Error "Failed to create user 'RDP': $_"
+                  exit 1
+              }
+          }
+
+          # Ensure group membership (idempotent)
+          if (-not (Get-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue)) {
+              Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          }
+          if (-not (Get-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue)) {
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          }
+
+          # Expose credentials to subsequent steps (note: this writes the password into the runner environment)
           echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
           
           if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
+              Write-Error "User creation or update failed"
               exit 1
           }
 
@@ -103,7 +143,7 @@ jobs:
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
           Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "Password: $env:RDP_CREDS"
           Write-Host "==================`n"
           
           # Keep runner active indefinitely (or until manually cancelled)
